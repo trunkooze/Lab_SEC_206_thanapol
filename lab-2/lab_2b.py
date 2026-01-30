@@ -122,8 +122,9 @@ def build_user_db_argon2id(passwords: Iterable[str]) -> Dict[str, PasswordRecord
 
     for i, pw in enumerate(passwords, start=1):
         username = f"username{i}"
-        # TODO: implement
-        # Hint: use os.urandom(SALT_LEN) to generate salt
+        salt = os.urandom(SALT_LEN)
+        pwd_hash = argon2id_raw(pw, salt)
+        db[username] = PasswordRecord(salt=salt, pwd_hash=pwd_hash)
 
     return db
 
@@ -148,9 +149,13 @@ def verify_login(username: str, password: str, db: Dict[str, PasswordRecord]) ->
     Return:
     - True if correct, else False
     """
-    # TODO: implement
-    # Hint: you can compare hashes with
-    #       hmac.compare_digest(candidate_hash, record.pwd_hash)
+    if username not in db:
+        return False
+    
+    record = db[username]
+    candidate_hash = argon2id_raw(password, record.salt)
+    
+    return hmac.compare_digest(candidate_hash, record.pwd_hash)
 
 def main() -> None:
     if not os.path.exists(PASSWORD_LIST_PATH):
@@ -187,3 +192,17 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# result
+# [+] Loaded 100 passwords
+# [+] Built user DB with 100 users
+
+# [TEST] Correct login for username1: True (expected True)
+# [TEST] Wrong password for username1: False (expected False)
+# [TEST] Unknown user: False (expected False)
+
+# Key takeaways:
+# - Each user has a unique random salt. This defeats rainbow tables.
+# - Argon2id makes each guess expensive (time + memory).
+# - Use constant-time comparison for hash equality checks (compare_digest).

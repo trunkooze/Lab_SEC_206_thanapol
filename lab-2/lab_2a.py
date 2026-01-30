@@ -105,7 +105,11 @@ def build_rainbow_table_sha256(passwords: Iterable[str]) -> Dict[str, str]:
     """
     table: Dict[str, str] = {}
 
-    # TODO: implement
+    for password in passwords:
+        hash_hex = sha256_hex(password.encode('utf-8'))
+        # Keep the first password if there's a collision
+        if hash_hex not in table:
+            table[hash_hex] = password
 
     return table
 
@@ -116,7 +120,7 @@ def crack_sha256_hash(target_hash_hex: str, table: Dict[str, str]) -> str | None
     Given a SHA-256 hex digest (lowercase), return the matching password if present,
     else return None.
     """
-    # TODO: implement
+    return table.get(target_hash_hex, None)
 
 
 def build_rainbow_table_argon2id_fixed_salt(passwords: Iterable[str]) -> Dict[bytes, str]:
@@ -135,7 +139,11 @@ def build_rainbow_table_argon2id_fixed_salt(passwords: Iterable[str]) -> Dict[by
     """
     table: Dict[bytes, str] = {}
 
-    # TODO: implement
+    for password in passwords:
+        hash_bytes = argon2id_raw(password, ARGON2_FIXED_SALT)
+        # Keep the first password if there's a collision
+        if hash_bytes not in table:
+            table[hash_bytes] = password
 
     return table
 
@@ -185,3 +193,14 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# result
+# [+] Loaded 1000 candidate passwords
+# [+] Demo target SHA-256 hash (you are 'given' this): 8cbbcf29d9cef89675c5f5c1dcfe827d0570416a5aaba30dd0de159661ad905b
+# [+] Built SHA-256 rainbow table with 1000 entries in 0.0051 s
+# [+] Cracked! hash -> password = 'pepper'
+#     (Matches original? True)
+
+# [*] Timing-only: Argon2id precompute with FIXED SALT (not realistic)
+# [+] Built Argon2id(fixed salt) table with 1000 entries in 55.5814 s
+# [+] Rough slowdown vs SHA-256: 10803.3×
