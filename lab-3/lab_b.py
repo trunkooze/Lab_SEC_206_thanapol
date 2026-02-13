@@ -73,13 +73,16 @@ def aead_encrypt_row(key: bytes, row_index: int, version: int, plaintext: bytes)
       - Generate and store a fresh random nonce (12 bytes).
       - Use AEAD associated data = _encode_ad(row_index, version).
       - Return (nonce, ciphertext, tag).
-
-    Guidance (high-level):
-      - Initialize an AEAD cipher object with (key, nonce).
-      - Feed the associated data into the cipher (so it is authenticated).
-      - Encrypt the plaintext and obtain both ciphertext and authentication tag.
     """
-    raise NotImplementedError
+    nonce = get_random_bytes(12)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    
+    ad = _encode_ad(row_index, version)
+    cipher.update(ad)
+    
+    ciphertext, tag = cipher.encrypt_and_digest(plaintext)
+    
+    return RowBlob(nonce=nonce, ciphertext=ciphertext, tag=tag)
 
 
 def aead_decrypt_row(key: bytes, row_index: int, version: int, blob: RowBlob) -> bytes:
@@ -93,13 +96,15 @@ def aead_decrypt_row(key: bytes, row_index: int, version: int, blob: RowBlob) ->
       - Verify the authentication tag.
       - If verification fails, raise ValueError.
       - If verification succeeds, return the plaintext.
-
-    Guidance (high-level):
-      - Initialize the same AEAD mode as encryption with (key, blob.nonce).
-      - Feed the same associated data.
-      - Decrypt and verify using (ciphertext, tag).
     """
-    raise NotImplementedError
+    cipher = AES.new(key, AES.MODE_GCM, nonce=blob.nonce)
+    
+    ad = _encode_ad(row_index, version)
+    cipher.update(ad)
+    
+    plaintext = cipher.decrypt_and_verify(blob.ciphertext, blob.tag)
+    
+    return plaintext
 
 
 class EncryptedVector:

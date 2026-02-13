@@ -87,7 +87,17 @@ def secure_encrypt_then_mac(enc_key: bytes, mac_key: bytes, plaintext: bytes) ->
     Return:
       Packet(nonce, ciphertext, tag)
     """
-    raise NotImplementedError
+    nonce = get_random_bytes(15) 
+    cipher = AES.new(enc_key, AES.MODE_CTR, nonce=nonce)
+    ciphertext = cipher.encrypt(plaintext)
+    
+    # Compute MAC over nonce || ciphertext
+    h = HMAC.new(mac_key, digestmod=SHA256)
+    h.update(nonce)
+    h.update(ciphertext)
+    tag = h.digest()
+    
+    return Packet(nonce=nonce, ciphertext=ciphertext, tag=tag)
 
 
 def secure_verify_and_decrypt(enc_key: bytes, mac_key: bytes, pkt: Packet) -> bytes:
@@ -99,7 +109,15 @@ def secure_verify_and_decrypt(enc_key: bytes, mac_key: bytes, pkt: Packet) -> by
       2) If verification fails, raise ValueError.
       3) Decrypt ciphertext using AES and return plaintext.
     """
-    raise NotImplementedError
+    h = HMAC.new(mac_key, digestmod=SHA256)
+    h.update(pkt.nonce)
+    h.update(pkt.ciphertext)
+    h.verify(pkt.tag)  # Raises ValueError if verification fails
+    
+    cipher = AES.new(enc_key, AES.MODE_CTR, nonce=pkt.nonce)
+    plaintext = cipher.decrypt(pkt.ciphertext)
+    
+    return plaintext
 
 
 # ============================================================
