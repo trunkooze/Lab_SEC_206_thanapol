@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import base64
+import json
 import secrets
 import time
 from dataclasses import dataclass
 from typing import Any
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from client_app.pinned_keys import load_pinned_server_signing_public_key_pem
 from server_app.signing_keys import load_server_signing_private_key_pem
@@ -12,6 +18,57 @@ from server_app.signing_keys import load_server_signing_private_key_pem
 
 def _b64e(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
+
+
+def _b64d(s: str) -> bytes:
+    return base64.b64decode(s)
+
+
+def _stable_json(obj: Any) -> bytes:
+    return json.dumps(obj, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _gen_p256_keypair() -> tuple[str, str]:
+    """Return (priv_der_b64, pub_der_b64) for a fresh P-256 keypair."""
+    priv = ec.generate_private_key(ec.SECP256R1())
+    priv_der = priv.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    pub_der = priv.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return _b64e(priv_der), _b64e(pub_der)
+
+
+def _ecdh(priv_der_b64: str, peer_pub_der_b64: str) -> bytes:
+    priv = serialization.load_der_private_key(_b64d(priv_der_b64), password=None)
+    peer_pub = serialization.load_der_public_key(_b64d(peer_pub_der_b64))
+    return priv.exchange(ec.ECDH(), peer_pub)  # type: ignore[arg-type]
+
+
+def _derive_session_keys(
+    shared_secret: bytes,
+    nonce_c: bytes,
+    nonce_s: bytes,
+    session_id_bytes: bytes,
+) -> tuple[str, str]:
+    salt = nonce_c + nonce_s
+    k_c2s = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        info=b"a3/v1/c2s/" + session_id_bytes,
+    ).derive(shared_secret)
+    k_s2c = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        info=b"a3/v1/s2c/" + session_id_bytes,
+    ).derive(shared_secret)
+    return _b64e(k_c2s), _b64e(k_s2c)
 
 
 @dataclass
@@ -39,32 +96,24 @@ class ClientHandshake:
 
     @classmethod
     def init(cls) -> "ClientHandshake":
-        # TODO [A3]: generate fresh client-side handshake state.
-        # Use a fresh P-256 ephemeral keypair. Any key bytes stored in *_b64 fields should be
-        # encoded as DER bytes and then base64-encoded for JSON transport.
-        # Also create a client nonce and timestamp for ClientHello and session derivation.
+        priv_b64, pub_b64 = _gen_p256_keypair()
         return cls(
-            client_eph_priv_b64="",
-            client_eph_pub_b64="",
-            nonce_c_b64="",
+            client_eph_priv_b64=priv_b64,
+            client_eph_pub_b64=pub_b64,
+            nonce_c_b64=_b64e(secrets.token_bytes(32)),
             ts=int(time.time()),
         )
 
     def create_hello(self) -> dict[str, Any]:
-        # TODO [A3]: serialize the public ClientHello fields from local handshake state.
-        # The final version should include the public values the server needs, such as the
-        # client's ephemeral public key, nonce, and timestamp.
         return {
             "proto": "a3/v1",
+            "client_eph_pub_b64": self.client_eph_pub_b64,
+            "nonce_c_b64": self.nonce_c_b64,
             "ts": int(self.ts),
         }
 
     def verify_server_hello(self, server_hello: dict[str, Any]) -> bool:
-        # TODO [A3]: verify that ServerHello is well-formed, fresh, and authenticated.
-        # Use the pinned NIST P-256 server public key from client_app/pinned_keys.py to verify
-        # the server-authentication material over the expected ServerHello fields before
-        # accepting the server's response.
-        _pinned_server_public_key_pem = load_pinned_server_signing_public_key_pem()
+        pinned_pub_pem = load_pinned_server_signing_public_key_pem()
         if str(server_hello.get("proto") or "") != "a3/v1":
             return False
         session_id_b64 = str(server_hello.get("session_id_b64") or "")
@@ -79,18 +128,38 @@ class ClientHandshake:
         # Allow up to 5 minutes of clock skew when checking freshness.
         if server_ts + 300 < int(self.ts):
             return False
+        sig_b64 = str(server_hello.get("sig_b64") or "")
+        if not sig_b64:
+            return False
+        transcript_obj = {k: v for k, v in server_hello.items() if k != "sig_b64"}
+        try:
+            pub_key = serialization.load_pem_public_key(pinned_pub_pem)
+            pub_key.verify(  # type: ignore[union-attr]
+                _b64d(sig_b64),
+                _stable_json(transcript_obj),
+                ec.ECDSA(hashes.SHA256()),
+            )
+        except Exception:
+            return False
         return True
 
     def finalize(self, server_hello: dict[str, Any]) -> ChannelSessionState:
-        # TODO [A3]: derive the client-side session state from the local handshake state and
-        # the received ServerHello.
-        # The final version should derive the session id, c2s key, s2c key, and expiry that
-        # the record layer will later use.
+        session_id_b64 = str(server_hello["session_id_b64"])
+        shared_secret = _ecdh(
+            self.client_eph_priv_b64,
+            str(server_hello["server_eph_pub_b64"]),
+        )
+        k_c2s_b64, k_s2c_b64 = _derive_session_keys(
+            shared_secret,
+            _b64d(self.nonce_c_b64),
+            _b64d(str(server_hello["nonce_s_b64"])),
+            _b64d(session_id_b64),
+        )
         return ChannelSessionState(
-            session_id_b64=str(server_hello.get("session_id_b64") or ""),
-            k_c2s_b64="",
-            k_s2c_b64="",
-            expires_at=int(server_hello.get("expires_at") or 0),
+            session_id_b64=session_id_b64,
+            k_c2s_b64=k_c2s_b64,
+            k_s2c_b64=k_s2c_b64,
+            expires_at=int(server_hello["expires_at"]),
         )
 
     def accept_server_hello(self, server_hello: dict[str, Any]) -> ChannelSessionState:
@@ -111,47 +180,62 @@ class ServerHandshake:
 
     @classmethod
     def init(cls) -> "ServerHandshake":
-        # TODO [A3]: generate fresh server-side handshake state.
-        # Use a fresh P-256 ephemeral keypair. Any key bytes stored in *_b64 fields should be
-        # encoded as DER bytes and then base64-encoded for JSON transport.
-        # Also create the server nonce, session id, and expiry before responding to ClientHello.
+        priv_b64, pub_b64 = _gen_p256_keypair()
         server_ts = int(time.time())
         return cls(
-            server_eph_priv_b64="",
-            server_eph_pub_b64="",
-            nonce_s_b64="",
+            server_eph_priv_b64=priv_b64,
+            server_eph_pub_b64=pub_b64,
+            nonce_s_b64=_b64e(secrets.token_bytes(32)),
             server_ts=server_ts,
             session_id_b64=_b64e(secrets.token_bytes(16)),
             expires_at=server_ts + 30 * 60,
         )
 
     def respond_to_client_hello(self, client_hello: dict[str, Any]) -> dict[str, Any]:
-        # TODO [A3]: validate ClientHello and serialize the public ServerHello fields from
-        # the server's local handshake state.
-        # The final version should also produce the server-authentication material using the
-        # provided NIST P-256 server signing key so the client can verify ServerHello.
-        _server_signing_private_key_pem = load_server_signing_private_key_pem()
+        signing_priv_pem = load_server_signing_private_key_pem()
         if str(client_hello.get("proto") or "") != "a3/v1":
             raise ValueError("protocol_mismatch")
         if int(client_hello.get("ts") or 0) <= 0:
             raise ValueError("missing_client_ts")
+        if not str(client_hello.get("client_eph_pub_b64") or ""):
+            raise ValueError("missing_client_eph_pub")
+        if not str(client_hello.get("nonce_c_b64") or ""):
+            raise ValueError("missing_nonce_c")
 
-        return {
+        # Build unsigned server hello; embed client_hello so the signature binds both sides.
+        unsigned = {
             "proto": "a3/v1",
+            "server_eph_pub_b64": self.server_eph_pub_b64,
+            "nonce_s_b64": self.nonce_s_b64,
             "session_id_b64": self.session_id_b64,
             "server_ts": int(self.server_ts),
             "expires_at": int(self.expires_at),
+            "client_hello": client_hello,
         }
+        signing_priv = serialization.load_pem_private_key(signing_priv_pem, password=None)
+        sig = signing_priv.sign(  # type: ignore[union-attr]
+            _stable_json(unsigned),
+            ec.ECDSA(hashes.SHA256()),
+        )
+        return {**unsigned, "sig_b64": _b64e(sig)}
 
     def finalize(self, client_hello: dict[str, Any]) -> ChannelSessionState:
-        # TODO [A3]: derive the server-side session state from the server's local handshake
-        # state plus the provided ClientHello so it matches what the client derives.
         if not self.session_id_b64:
             raise ValueError("missing_session_id")
+        shared_secret = _ecdh(
+            self.server_eph_priv_b64,
+            str(client_hello["client_eph_pub_b64"]),
+        )
+        k_c2s_b64, k_s2c_b64 = _derive_session_keys(
+            shared_secret,
+            _b64d(str(client_hello["nonce_c_b64"])),
+            _b64d(self.nonce_s_b64),
+            _b64d(self.session_id_b64),
+        )
         return ChannelSessionState(
             session_id_b64=self.session_id_b64,
-            k_c2s_b64="",
-            k_s2c_b64="",
+            k_c2s_b64=k_c2s_b64,
+            k_s2c_b64=k_s2c_b64,
             expires_at=int(self.expires_at),
         )
 
@@ -164,11 +248,16 @@ class ServerHandshake:
 
 class ChannelCipher:
     def __init__(self, key_b64: str, session_id_b64: str):
-        # This object reuses the session-specific keying material across records.
-        # The secure implementation should still create a fresh AEAD cipher/nonce for each
-        # record instead of trying to reuse one AEAD instance across multiple messages.
         self.key_b64 = key_b64
         self.session_id_b64 = session_id_b64
+
+    def _aad(self, direction: str, counter: int, path: str) -> bytes:
+        return _stable_json({
+            "counter": int(counter),
+            "dir": direction,
+            "path": path,
+            "session_id_b64": self.session_id_b64,
+        })
 
     def encrypt_record(
         self,
@@ -177,24 +266,22 @@ class ChannelCipher:
         path: str,
         payload_obj: dict[str, Any],
     ) -> dict[str, Any]:
-        # TODO [A3]: AEAD-encrypt the record and bind session id, direction, counter, and
-        # path in AAD.
-        # payload_obj is the sensitive application data that should be encrypted.
-        # The other parameters are the record context that should be authenticated so both
-        # sides agree on which session, direction, counter value, and route this record
-        # belongs to.
-        # The path is the outer route, such as /api/login or /api/messages/pull.
-        # Keep proto/session_id_b64/dir/counter/path as outer metadata and replace plaintext
-        # payload_obj with encrypted-record fields such as nonce_b64, ct_b64, and tag_b64.
-        # In the secure version, payload_obj should no longer appear on the wire.
-        _ = self.key_b64
+        key = _b64d(self.key_b64)
+        nonce = secrets.token_bytes(12)
+        aad = self._aad(direction, counter, path)
+        aesgcm = AESGCM(key)
+        ct_and_tag = aesgcm.encrypt(nonce, _stable_json(payload_obj), aad)
+        ct = ct_and_tag[:-16]
+        tag = ct_and_tag[-16:]
         return {
             "proto": "a3/v1",
             "session_id_b64": self.session_id_b64,
             "dir": direction,
             "counter": int(counter),
             "path": path,
-            "payload_obj": payload_obj,
+            "nonce_b64": _b64e(nonce),
+            "ct_b64": _b64e(ct),
+            "tag_b64": _b64e(tag),
         }
 
     def decrypt_record(
@@ -204,18 +291,6 @@ class ChannelCipher:
         path: str,
         record_obj: dict[str, Any],
     ) -> dict[str, Any]:
-        # TODO [A3]: verify record integrity and decrypt the payload.
-        # The caller already knows the expected direction and path from the surrounding
-        # protocol flow, so the secure version should verify that the record is bound to that
-        # expected context before returning the payload.
-        # The path parameter is the expected outer route for this record. Bind it so a record
-        # created for one route cannot be replayed to another route.
-        # In the secure version, session_id_b64, direction, expected_counter, and path are all
-        # part of the authenticated context, not part of the encrypted payload itself.
-        # The first valid record counter is 0, so treat 0 as a real counter value.
-        # In the secure version, do not read payload_obj from the wire record. Verify and
-        # decrypt the encrypted record fields instead.
-        _ = self.key_b64
         if str(record_obj.get("proto") or "") != "a3/v1":
             raise ValueError("protocol_mismatch")
         if str(record_obj.get("session_id_b64") or "") != self.session_id_b64:
@@ -226,7 +301,11 @@ class ChannelCipher:
             raise ValueError("counter_mismatch")
         if str(record_obj.get("path") or "") != path:
             raise ValueError("path_mismatch")
-        payload_obj = record_obj.get("payload_obj")
-        if not isinstance(payload_obj, dict):
-            raise ValueError("missing_payload_obj")
-        return payload_obj
+        key = _b64d(self.key_b64)
+        nonce = _b64d(str(record_obj["nonce_b64"]))
+        ct = _b64d(str(record_obj["ct_b64"]))
+        tag = _b64d(str(record_obj["tag_b64"]))
+        aad = self._aad(direction, expected_counter, path)
+        aesgcm = AESGCM(key)
+        plaintext = aesgcm.decrypt(nonce, ct + tag, aad)
+        return json.loads(plaintext.decode("utf-8"))
